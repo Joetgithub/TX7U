@@ -9,17 +9,21 @@
 #define STOP_PIN 3
 
 // Needed to tweak these intervals in order to get more consistent readings
-#define PW_FIXED 1000    // Pulse width for the "fixed" part of signal
-#define PW_SHORT 550     // Pulse width for the "short" part of signal(1 bit)
-#define PW_LONG 1350     // Pulse width for the "long" part of signal (0 bit)
-#define PW_TOLERANCE 300 // plus/minus range for valid FIXED, SHORT and LONG pulses
-#define SIZE_BUFFER 88   // two pulses needed to determine each bit
-#define SIZE_PACKETS 6   // each packet is 8 bits
+#define PW_FIXED 1000       // Pulse width for the "fixed" part of signal
+#define PW_SHORT 550        // Pulse width for the "short" part of signal(1 bit)
+#define PW_LONG 1350        // Pulse width for the "long" part of signal (0 bit)
+#define PW_TOLERANCE 300    // plus/minus range for valid FIXED, SHORT and LONG pulses
+#define NOISE_THRESHOLD 180 // Typical noise pulse duration (in microseconds)
+#define SIZE_BUFFER 88      // two pulses needed to determine each bit
+#define SIZE_PACKETS_BUF 20 // Max number of undecoded pulse packets which can be stored in the buffer
 
 String _serverTS = "api.thingspeak.com";               // ThingSpeak Server
 String _serverWU = "weatherstation.wunderground.com";  // Weather Underground Server
 
 static volatile uint32_t pulseBuffer[SIZE_BUFFER]; //length of time in uSec of each pulse
+static volatile uint32_t packetBuffer[SIZE_PACKETS_BUF][SIZE_BUFFER]; //stores packets of pulses before decoding them
+static volatile int packetPos = 0;
+int _nextPacketPos = 0;
 
 bool _running;
 long _msLastLoop;
@@ -232,6 +236,7 @@ void loop()
         Serial.print(".");
         _msLastLoop = millis();
         _countDown = (_msNextDataPost - _msLastLoop) / 1000;
+        while(_nextPacketPos != packetPos) decodeTimings();
 
         // millis() will roll over every 49 days
         if (millis() > _msNextDataPost)
@@ -244,35 +249,57 @@ void loop()
     }
 }
 
+// IMPORTANT: This is an interrupt routine, so its duration should be as short as possible
+//            to avoid missing calls (if a pulse is received while we are still processing
+//            the previous one, we will miss it!).
+//            So: avoid Serial.print() and complex math like decoding timings
 void storePulse()
 {
-    static int pulsePos = 0;      // remember: static retains it's value between calls
-    static uint32_t timePrev = 0; // remember: static retains it's value between calls
+    static int pulsePos = 0;         // remember: static retains it's value between calls
+    static uint32_t timePrev = 0;    // remember: static retains it's value between calls
+    static uint32_t lastSync = 0;    // Number of pulses since last sync signal
+    static uint32_t noiseTiming = 0; // Timing interpolation for noise filter    
 
     uint32_t timeNow = micros();            // 16Mhz Uno board has 4uSec resolution for micros()
     uint32_t interval = timeNow - timePrev; // long 32bit value required for 1,000,000 uSec micros() resolution
+    timePrev = timeNow;
 
-    //long delay triggers evaluation of the buffer
-    //setting a lower minimum time means there will be more false alarms of evaluating noise
-    //but setting it higher means legitimate data _readings will be missed.  Seems that the
-    //minimum time delay interval floats around for each sensor.
-    if (interval > 20000 && interval < 400000)
-    { // in microseconds
-        Serial.print("pulsePos: ");
-        Serial.print(pulsePos);
-        Serial.print(", delay:");
-        Serial.print(interval);
-        pulseBuffer[pulsePos] = PW_FIXED; // marker the point in the buffer where the
-        decodeTimings(pulsePos);          // analyze the captured data transmission
+    if (interval < NOISE_THRESHOLD) {
+        // Probably this short pulse is noise, so we ignore it
+        pulseBuffer[pulsePos] += interval / 2;
+        noiseTiming += interval / 2;
+        return;
+    }
+    else if (noiseTiming > 0) {
+        interval += noiseTiming;
+        noiseTiming = 0;
     }
 
     //continously roll over the buffer
-    if (pulsePos >= SIZE_BUFFER)
+    if (++pulsePos >= SIZE_BUFFER)
         pulsePos = 0;
-
+    
     //every pulse is stored in the buffer
-    pulseBuffer[pulsePos++] = interval;
-    timePrev = timeNow;
+    pulseBuffer[pulsePos] = interval;
+    //keeps track of last synchronization signal (= long delay)
+    lastSync++;
+
+    //long delay triggers storing the buffer in a "pule packet", which will be analyzed later
+    //setting a lower minimum time means there will be more false alarms of evaluating noise
+    //but setting it higher means legitimate data _readings will be missed.  Seems that the
+    //minimum time delay interval floats around for each sensor.
+    if (interval > 5000)
+    { // in microseconds
+        // Sync signal must be at least one packet away from the previous one
+        if (lastSync > SIZE_BUFFER) {
+            for(int p = 0; p < SIZE_BUFFER; p++) {
+                if (++pulsePos == SIZE_BUFFER) pulsePos = 0;
+                packetBuffer[packetPos][p] = pulseBuffer[pulsePos];
+            }
+            if (++packetPos == SIZE_PACKETS_BUF) packetPos = 0;
+        }
+        lastSync = 1;        
+    }
 }
 
 int convertPulsesToBit(uint32_t pulse1, uint32_t pulse2)
@@ -303,91 +330,73 @@ void stopRecord()
     Serial.println("\nSTOP.");
 }
 
-void decodeTimings(int pulsePos)
+void decodeTimings()
 {
-    // Dump all the pulses gives you a much better idea of how things work
-    //Serial.print("\n");
-    //for (int i = 0; i  < SIZE_BUFFER; i++) {
-    //     Serial.printlnf("[%d]:%d", i, pulseBuffer[i]);  // printlnf does not work for Arduino
-    //}
+    volatile uint32_t *packet = &packetBuffer[_nextPacketPos];
+    if (++_nextPacketPos == SIZE_PACKETS_BUF) _nextPacketPos = 0;
 
-    //initialize array to 0
-    uint8_t packets[SIZE_PACKETS] = {0}; //uint8_t = unsigned char = byte; is an unsigned 8 bit
-
-    uint32_t pulse1, pulse2;
+    // Decode and pack the bits into an array of bytes
+    uint8_t bytes[6] = {0};
     int decodedBit;
-
-    //Determination of the length is within the boundaries of the tolerance.
-    for (int b = 0; b < SIZE_BUFFER / 2; b++)
-    {
-        pulsePos++;
-        if (pulsePos == SIZE_BUFFER)
-            pulsePos = 0;
-        pulse1 = pulseBuffer[pulsePos]; //should be LONG or SHORT pulse
-        pulsePos++;
-        if (pulsePos == SIZE_BUFFER)
-            pulsePos = 0;
-        pulse2 = pulseBuffer[pulsePos]; //should be FIXED pulse
-        decodedBit = convertPulsesToBit(pulse1, pulse2);
-
-        if (decodedBit <= -1)
+    packet[SIZE_BUFFER - 1] = PW_FIXED;
+    for(int b = 0; b < SIZE_BUFFER; b += 2) {
+        decodedBit = convertPulsesToBit(packet[b], packet[b+1]);
+        if (decodedBit < 0)
         {
             Serial.print("\nerror bit #");
             Serial.print(b);
             Serial.print("=");
             Serial.print(decodedBit);
             Serial.print(", pulsePos=");
-            Serial.print(pulsePos);
+            Serial.print(b);
             Serial.print(" pulse1:"); // should be LONG or SHORT duration
-            Serial.print(pulse1);
+            Serial.print(packet[b]);
             Serial.print(" pulse2:"); // should be FIXED duration
-            Serial.print(pulse2);
+            Serial.print(packet[b+1]);
             Serial.print("\n");
             return;
         }
 
         //crazy math trick shortcut to load each of the 44 bits one at a time across the five bytes in the array
-        packets[b / 8] <<= 1; // shift one to the left to make space for the next bit
+        bytes[b / 16] <<= 1;
         //if the next bit is 0 then we are done as the above shift took care of that
         if (decodedBit == 1)
-            packets[b / 8]++; //otherwise set that bit to 1
+            bytes[b / 16]++; //otherwise set that bit to 1
     }
-    // Check parity. Parity decodedBit is #19 and it makes data bits (from #19 to #31) even
-    if (parity(packets[2] & 0x1F, packets[3]))
-    {
-        Serial.println("\nWrong parity: ");
-        printPacket(packets);
+
+    // check for the correct start sequence of the 44 bit temp/humidty data
+    if (bytes[0] != 0x0A) {
+        Serial.println("\nWrong start sequence");
         return;
+    }
+
+    // Check parity. Parity decodedBit is #19 and it makes data bits (from #19 to #31) even
+    uint8_t bits = (bytes[2] & 0x1F) ^ bytes[3];
+    bits ^= bits >> 4;
+    bits ^= bits >> 2;
+    bits ^= bits >> 1;
+    if (bits & 1) {
+        Serial.println("\nWrong parity: ");
+        printPacket(bytes);
+        return; // Parity error
     }
 
     // Checksum
     uint8_t checksum = 0;
-    for (int b = 0; b < SIZE_PACKETS - 1; b++)
-        checksum += (packets[b] & 0xF) + (packets[b] >> 4);
-    if ((checksum & 0xF) != packets[SIZE_PACKETS - 1])
+    for (int b = 0; b < 5; b++)
+        checksum += (bytes[b] & 0xF) + (bytes[b] >> 4);
+    if ((checksum & 0xF) != bytes[5])
     {
         Serial.print("\nWrong checksum: ");
         Serial.println(checksum & 0xF, BIN);
-        printPacket(packets);
+        printPacket(bytes);
         return;
     }
 
-    // check for the correct start sequence of the 44 bit temp/humidty data
-    if (packets[0] != 0x0A)
-        return;
 
     Serial.println();
-    printPacket(packets);
-    decodeBits(packets);
-}
-
-uint8_t parity(uint8_t b1, uint8_t b2)
-{
-    uint8_t _t = b1 ^ b2; //?????
-    _t ^= _t >> 4;
-    _t ^= _t >> 2;
-    _t ^= _t >> 1;
-    return _t & 1;
+    printPacket(bytes);
+    decodeBits(bytes);
 }
 
 void printPacket(uint8_t *packets)
